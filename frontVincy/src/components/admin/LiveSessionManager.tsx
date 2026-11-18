@@ -39,6 +39,7 @@ interface LiveSession {
   date_time: string;
   duration_minutes: number;
   youtube_link: string | null;
+  image_url?: string | null;
   created_at: string;
   updated_at: string | null;
   livestatus: boolean; // Added the new livestatus field
@@ -52,10 +53,41 @@ interface LiveSessionPayload {
   date_time: string;
   duration_minutes: number;
   youtube_link: string | null;
+  image_url: string;
   livestatus: boolean; // Added the new livestatus field
 }
 
 const API_URL = import.meta.env.VITE_API_URL;
+
+// YouTube video thumbnails use a predictable public URL based on the video ID.
+// Restrict the host to YouTube so a different site's URL cannot be mistaken for a video.
+const getYouTubeThumbnail = (link: string | null): string | null => {
+  if (!link?.trim()) return null;
+
+  try {
+    const url = new URL(link.trim());
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+
+    const host = url.hostname.toLowerCase().replace(/^(www\.|m\.)/, "");
+    const parts = url.pathname.split("/").filter(Boolean);
+    let videoId: string | null = null;
+
+    if (host === "youtu.be") {
+      videoId = parts[0] ?? null;
+    } else if (host === "youtube.com") {
+      if (parts[0] === "watch") {
+        videoId = url.searchParams.get("v");
+      } else if (["live", "shorts", "embed"].includes(parts[0])) {
+        videoId = parts[1] ?? null;
+      }
+    }
+
+    if (!videoId || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) return null;
+    return `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+  } catch {
+    return null;
+  }
+};
 
 const LiveSessionManager = () => {
   const { token } = useAuth();
@@ -63,6 +95,7 @@ const LiveSessionManager = () => {
   const [allSessions, setAllSessions] = useState<LiveSession[]>([]);
   const [isEditing, setIsEditing] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
   const [dateFilter, setDateFilter] = useState<string>("");
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   
@@ -131,6 +164,7 @@ const LiveSessionManager = () => {
       date_time: tomorrow.toISOString(),
       duration_minutes: 60,
       youtube_link: "",
+      image_url: null,
       created_at: new Date().toISOString(),
       updated_at: null,
       livestatus: false // Initialize with livestatus off
@@ -145,8 +179,13 @@ const LiveSessionManager = () => {
     setIsEditing(false);
   };
 
+  // datetime-local expects LOCAL clock time, not the leading part of a UTC ISO string.
   const formatDateTimeForInput = (dateTimeStr: string) => {
-    return dateTimeStr.slice(0, 16); // Format for datetime-local input
+    const date = new Date(dateTimeStr);
+    if (Number.isNaN(date.getTime())) return "";
+
+    const pad = (value: number) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
   };
 
   const handleInputChange = (field: string, value: string | number | boolean) => {
@@ -161,20 +200,57 @@ const LiveSessionManager = () => {
     });
   };
 
-  const createSession = async () => {
-    if (!liveSession) return;
+  // Build the same validated payload for both POST and PUT. Prefer an existing
+  // custom image if the video link hasn't changed; otherwise use its new thumbnail.
+  const buildSessionPayload = (session: LiveSession): LiveSessionPayload | null => {
+    const youtubeLink = session.youtube_link?.trim() || null;
+    const original = allSessions.find(s => s.id === session.id);
+    const originalLink = original?.youtube_link?.trim() || null;
+    const existingImageUrl = session.image_url?.trim() || null;
+    const generatedThumbnail = getYouTubeThumbnail(youtubeLink);
+
+    if (youtubeLink && !generatedThumbnail) {
+      toast.error("Please enter a valid YouTube video link.");
+      return null;
+    }
+
+    const imageUrl = session.id && original && youtubeLink === originalLink && existingImageUrl
+      ? existingImageUrl
+      : generatedThumbnail || existingImageUrl;
+
+    if (!imageUrl) {
+      toast.error("Please enter a YouTube video link before saving.");
+      return null;
+    }
+
+    const date = new Date(session.date_time);
+    if (Number.isNaN(date.getTime())) {
+      toast.error("Please enter a valid session date and time.");
+      return null;
+    }
+    if (!Number.isFinite(session.duration_minutes) || session.duration_minutes <= 0) {
+      toast.error("Session duration must be greater than zero.");
+      return null;
+    }
+
+    return {
+      session_title: session.session_title,
+      host: session.host,
+      description: session.description,
+      date_time: date.toISOString(),
+      duration_minutes: session.duration_minutes,
+      youtube_link: youtubeLink,
+      image_url: imageUrl,
+      livestatus: session.livestatus,
+    };
+  };
+
+  const createSession = async (): Promise<boolean> => {
+    if (!liveSession) return false;
+    const payload = buildSessionPayload(liveSession);
+    if (!payload) return false;
 
     try {
-      const payload: LiveSessionPayload = {
-        session_title: liveSession.session_title,
-        host: liveSession.host,
-        description: liveSession.description,
-        date_time: liveSession.date_time,
-        duration_minutes: liveSession.duration_minutes,
-        youtube_link: liveSession.youtube_link,
-        livestatus: liveSession.livestatus
-      };
-
       const response = await fetch(`${API_URL}/admin/live-session/`, {
         method: "POST",
         headers: {
@@ -185,38 +261,31 @@ const LiveSessionManager = () => {
       });
 
       if (!response.ok) {
-        throw new Error('Failed to create live session');
+        throw new Error(`Failed to create live session (HTTP ${response.status})`);
       }
 
-      const newSession = await response.json();
+      const newSession: LiveSession = await response.json();
       setLiveSession(newSession);
-      
-      // Add to all sessions list
-      setAllSessions(prev => [...prev, newSession].sort((a, b) => 
+
+      setAllSessions(prev => [...prev, newSession].sort((a, b) =>
         new Date(b.date_time).getTime() - new Date(a.date_time).getTime()
       ));
-      
+
       toast.success("Live session created successfully!");
+      return true;
     } catch (error) {
       console.error("Error creating live session:", error);
       toast.error("Failed to create live session");
+      return false;
     }
   };
 
-  const updateSession = async () => {
-    if (!liveSession || !liveSession.id) return;
+  const updateSession = async (): Promise<boolean> => {
+    if (!liveSession?.id) return false;
+    const payload = buildSessionPayload(liveSession);
+    if (!payload) return false;
 
     try {
-      const payload: LiveSessionPayload = {
-        session_title: liveSession.session_title,
-        host: liveSession.host,
-        description: liveSession.description,
-        date_time: liveSession.date_time,
-        duration_minutes: liveSession.duration_minutes,
-        youtube_link: liveSession.youtube_link,
-        livestatus: liveSession.livestatus
-      };
-
       const response = await fetch(`${API_URL}/admin/live-session/${liveSession.id}`, {
         method: "PUT",
         headers: {
@@ -227,23 +296,24 @@ const LiveSessionManager = () => {
       });
 
       if (!response.ok) {
-        throw new Error('Failed to update live session');
+        throw new Error(`Failed to update live session (HTTP ${response.status})`);
       }
 
-      const updatedSession = await response.json();
+      const updatedSession: LiveSession = await response.json();
       setLiveSession(updatedSession);
-      
-      // Update in the all sessions list
-      setAllSessions(prev => prev.map(s => 
+
+      setAllSessions(prev => prev.map(s =>
         s.id === updatedSession.id ? updatedSession : s
-      ).sort((a, b) => 
+      ).sort((a, b) =>
         new Date(b.date_time).getTime() - new Date(a.date_time).getTime()
       ));
-      
+
       toast.success("Live session updated successfully!");
+      return true;
     } catch (error) {
       console.error("Error updating live session:", error);
       toast.error("Failed to update live session");
+      return false;
     }
   };
 
@@ -316,12 +386,15 @@ const LiveSessionManager = () => {
   };
 
   const handleSave = async () => {
-    if (liveSession?.id) {
-      await updateSession();
-    } else {
-      await createSession();
+    if (!liveSession || isSaving) return;
+    setIsSaving(true);
+    try {
+      const succeeded = liveSession.id ? await updateSession() : await createSession();
+      // Keep the form open if validation or the API request failed.
+      if (succeeded) setIsEditing(false);
+    } finally {
+      setIsSaving(false);
     }
-    setIsEditing(false);
   };
 
   const handleLiveStatusToggle = (checked: boolean) => {
@@ -421,7 +494,7 @@ const LiveSessionManager = () => {
         {isEditing ? (
           <div className="space-x-2">
             <Button variant="outline" onClick={() => setIsEditing(false)}>Cancel</Button>
-            <Button onClick={handleSave}>Save Changes</Button>
+            <Button onClick={handleSave} disabled={isSaving}>{isSaving ? "Saving..." : "Save Changes"}</Button>
           </div>
         ) : (
           <div className="space-x-2">
@@ -481,7 +554,12 @@ const LiveSessionManager = () => {
                       id="session-datetime"
                       type="datetime-local"
                       value={formatDateTimeForInput(liveSession.date_time)}
-                      onChange={(e) => handleInputChange('date_time', e.target.value)}
+                      onChange={(e) => {
+                        // Interpret the chosen time in the admin's local timezone.
+                        const value = e.target.value;
+                        const date = value ? new Date(value) : null;
+                        handleInputChange('date_time', date && !Number.isNaN(date.getTime()) ? date.toISOString() : '');
+                      }}
                     />
                   </div>
                   <div className="sm:w-1/3">
